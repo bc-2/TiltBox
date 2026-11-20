@@ -4,13 +4,13 @@
 #include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/rmt.h"
-#include "driver/i2c.h"
+#include "driver/rmt_tx.h"
+#include "driver/i2c_master.h"
 #include "esp_system.h"
 #include "esp_random.h"
 
 // I2C config
-#define I2C_PORT        I2C_NUM_0
+#define I2C_PORT        0
 #define I2C_SDA         GPIO_NUM_8
 #define I2C_SCL         GPIO_NUM_9
 #define I2C_FREQ_HZ     100000
@@ -25,7 +25,7 @@
 
 // WS2812 config
 #define WS2812_PIN      GPIO_NUM_10
-#define RMT_CHANNEL     RMT_CHANNEL_0
+#define RMT_RESOLUTION_HZ  (10 * 1000 * 1000)  // 1 tick = 100 ns, like legacy clk_div=8 @ 80 MHz
 #define LED_COUNT       64
 
 // WS2812 timing (in RMT ticks at 10MHz = 100ns per tick)
@@ -76,7 +76,8 @@ typedef struct {
 
 // Display buffers
 static uint8_t led_data[LED_COUNT * 3];
-static rmt_item32_t rmt_items[LED_COUNT * 24];
+static rmt_channel_handle_t rmt_chan = NULL;
+static rmt_encoder_handle_t ws2812_encoder = NULL;
 
 // Calibration values
 static int16_t cal_x = 0, cal_y = 0;
@@ -273,91 +274,69 @@ static void clear_display(void)
 
 static void ws2812_init(void)
 {
-    rmt_config_t config = {
-        .rmt_mode = RMT_MODE_TX,
-        .channel = RMT_CHANNEL,
+    rmt_tx_channel_config_t tx_chan_config = {
         .gpio_num = WS2812_PIN,
-        .clk_div = 8,
-        .mem_block_num = 4,
-        .tx_config = {
-            .loop_en = false,
-            .carrier_en = false,
-            .idle_output_en = true,
-            .idle_level = RMT_IDLE_LEVEL_LOW,
-        }
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = RMT_RESOLUTION_HZ,
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 1,
     };
-    rmt_config(&config);
-    rmt_driver_install(RMT_CHANNEL, 0, 0);
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &rmt_chan));
+
+    rmt_bytes_encoder_config_t bytes_encoder_config = {
+        .bit0 = { .duration0 = T0H, .level0 = 1, .duration1 = T0L, .level1 = 0 },
+        .bit1 = { .duration0 = T1H, .level0 = 1, .duration1 = T1L, .level1 = 0 },
+        .flags.msb_first = 1,
+    };
+    ESP_ERROR_CHECK(rmt_new_bytes_encoder(&bytes_encoder_config, &ws2812_encoder));
+
+    ESP_ERROR_CHECK(rmt_enable(rmt_chan));
 }
 
 static void ws2812_send(void)
 {
-    int item_idx = 0;
-    for (int i = 0; i < LED_COUNT * 3; i++) {
-        uint8_t byte = led_data[i];
-        for (int bit = 7; bit >= 0; bit--) {
-            if (byte & (1 << bit)) {
-                rmt_items[item_idx].duration0 = T1H;
-                rmt_items[item_idx].level0 = 1;
-                rmt_items[item_idx].duration1 = T1L;
-                rmt_items[item_idx].level1 = 0;
-            } else {
-                rmt_items[item_idx].duration0 = T0H;
-                rmt_items[item_idx].level0 = 1;
-                rmt_items[item_idx].duration1 = T0L;
-                rmt_items[item_idx].level1 = 0;
-            }
-            item_idx++;
-        }
-    }
-    rmt_write_items(RMT_CHANNEL, rmt_items, item_idx, true);
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+        .flags.eot_level = 0,  // idle low after transmission (same as legacy idle_output_en)
+    };
+    ESP_ERROR_CHECK(rmt_transmit(rmt_chan, ws2812_encoder, led_data, sizeof(led_data), &tx_config));
+    ESP_ERROR_CHECK(rmt_tx_wait_all_done(rmt_chan, portMAX_DELAY));
 }
 
 // ============ I2C / Accelerometer Functions ============
 
+static i2c_master_bus_handle_t i2c_bus = NULL;
+static i2c_master_dev_handle_t adxl345_dev = NULL;
+
 static void i2c_init(void)
 {
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_PORT,
         .sda_io_num = I2C_SDA,
         .scl_io_num = I2C_SCL,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
     };
-    i2c_param_config(I2C_PORT, &conf);
-    i2c_driver_install(I2C_PORT, conf.mode, 0, 0, 0);
+    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus));
+
+    i2c_device_config_t dev_config = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = ADXL345_ADDR,
+        .scl_speed_hz = I2C_FREQ_HZ,
+    };
+    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_config, &adxl345_dev));
 }
 
 static esp_err_t adxl345_write_reg(uint8_t reg, uint8_t value)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADXL345_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_write_byte(cmd, value, true);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    uint8_t buf[2] = { reg, value };
+    return i2c_master_transmit(adxl345_dev, buf, sizeof(buf), 100);
 }
 
 static esp_err_t adxl345_read_reg(uint8_t reg, uint8_t *data, size_t len)
 {
-    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADXL345_ADDR << 1) | I2C_MASTER_WRITE, true);
-    i2c_master_write_byte(cmd, reg, true);
-    i2c_master_start(cmd);
-    i2c_master_write_byte(cmd, (ADXL345_ADDR << 1) | I2C_MASTER_READ, true);
-    if (len > 1) {
-        i2c_master_read(cmd, data, len - 1, I2C_MASTER_ACK);
-    }
-    i2c_master_read_byte(cmd, data + len - 1, I2C_MASTER_NACK);
-    i2c_master_stop(cmd);
-    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT, cmd, pdMS_TO_TICKS(100));
-    i2c_cmd_link_delete(cmd);
-    return ret;
+    return i2c_master_transmit_receive(adxl345_dev, &reg, 1, data, len, 100);
 }
 
 static esp_err_t adxl345_init(void)
