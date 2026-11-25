@@ -6,6 +6,7 @@
 #include "freertos/task.h"
 #include "driver/rmt_tx.h"
 #include "driver/i2c_master.h"
+#include "driver/gpio.h"
 #include "esp_system.h"
 #include "esp_random.h"
 
@@ -22,6 +23,13 @@
 #define ADXL345_POWER_CTL   0x2D
 #define ADXL345_DATA_FORMAT 0x31
 #define ADXL345_DATAX0      0x32
+
+// MPU-6050 registers (InvenSense; auto-detected at address 0x68)
+#define MPU6050_ADDR         0x68
+#define MPU6050_WHO_AM_I     0x75
+#define MPU6050_PWR_MGMT_1   0x6B
+#define MPU6050_ACCEL_CONFIG 0x1C
+#define MPU6050_ACCEL_XOUT_H 0x3B
 
 // WS2812 config
 #define WS2812_PIN      GPIO_NUM_10
@@ -307,15 +315,44 @@ static void ws2812_send(void)
 
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static i2c_master_dev_handle_t adxl345_dev = NULL;
+static bool sensor_is_mpu6050 = false;
 
 // ADXL345 identification value expected in the DEVID register
 #define ADXL345_DEVID_VALUE 0xE5
 
-// Try one bus configuration: return ESP_OK (and leave bus/dev handles valid)
-// only if the ADXL345 answers with its correct DEVID.
-static esp_err_t i2c_try_bus(int sda, int scl, int freq,
-                             i2c_master_bus_handle_t *out_bus,
-                             i2c_master_dev_handle_t *out_dev)
+#define I2C_ADDR_INVENSENSE 0x68  // MPU-6050 (AD0 low)
+
+// I2C bus recovery: if a slave is stuck holding SDA low (e.g. after a reset
+// in the middle of a transaction), clock out up to 9 SCL pulses and generate
+// a STOP condition to release the line.
+static void i2c_bus_recover(int sda, int scl)
+{
+    gpio_set_direction((gpio_num_t)sda, GPIO_MODE_OUTPUT_OD);
+    gpio_set_direction((gpio_num_t)scl, GPIO_MODE_OUTPUT_OD);
+    gpio_set_level((gpio_num_t)sda, 1);
+    gpio_set_level((gpio_num_t)scl, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    if (gpio_get_level((gpio_num_t)sda)) return;  // bus already free
+
+    for (int i = 0; i < 9 && !gpio_get_level((gpio_num_t)sda); i++) {
+        gpio_set_level((gpio_num_t)scl, 0);
+        for (volatile int d = 0; d < 500; d++) { }
+        gpio_set_level((gpio_num_t)scl, 1);
+        for (volatile int d = 0; d < 500; d++) { }
+    }
+
+    // STOP condition: SDA low -> SDA high while SCL stays high
+    gpio_set_level((gpio_num_t)sda, 0);
+    for (volatile int d = 0; d < 500; d++) { }
+    gpio_set_level((gpio_num_t)sda, 1);
+    vTaskDelay(pdMS_TO_TICKS(2));
+    printf("I2C: bus recovery done (SDA now %d)\n", gpio_get_level((gpio_num_t)sda));
+}
+
+// Scan one bus configuration, identify every device that answers, and adopt
+// the bus if an ADXL345 (DEVID 0xE5) is found on it.
+static void i2c_scan_and_init_pins(int sda, int scl)
 {
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_PORT,
@@ -326,58 +363,63 @@ static esp_err_t i2c_try_bus(int sda, int scl, int freq,
         .flags.enable_internal_pullup = true,
     };
     i2c_master_bus_handle_t bus;
-    esp_err_t ret = i2c_new_master_bus(&bus_config, &bus);
-    if (ret != ESP_OK) return ret;
-
-    i2c_device_config_t dev_config = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = ADXL345_ADDR,
-        .scl_speed_hz = freq,
-    };
-    i2c_master_dev_handle_t dev;
-    ret = i2c_master_bus_add_device(bus, &dev_config, &dev);
-    if (ret != ESP_OK) {
-        i2c_del_master_bus(bus);
-        return ret;
+    if (i2c_new_master_bus(&bus_config, &bus) != ESP_OK) {
+        printf("I2C: bus init failed on SDA=%d SCL=%d\n", sda, scl);
+        return;
     }
 
-    uint8_t devid = 0;
-    ret = i2c_master_transmit_receive(dev, (uint8_t[]){ ADXL345_DEVID }, 1, &devid, 1, 100);
-    if (ret != ESP_OK || devid != ADXL345_DEVID_VALUE) {
-        i2c_master_bus_rm_device(dev);
-        i2c_del_master_bus(bus);
-        return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
-    }
+    printf("I2C: scanning SDA=%d SCL=%d...\n", sda, scl);
+    bool found = false;
+    for (uint8_t addr = 3; addr < 120; addr++) {
+        if (i2c_master_probe(bus, addr, 50) != ESP_OK) continue;
 
-    *out_bus = bus;
-    *out_dev = dev;
-    return ESP_OK;
+        uint8_t reg0 = 0xff, reg75 = 0xff;
+        i2c_device_config_t probe_dev_config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = I2C_FREQ_HZ,
+        };
+        i2c_master_dev_handle_t probe_dev;
+        if (i2c_master_bus_add_device(bus, &probe_dev_config, &probe_dev) != ESP_OK) continue;
+        i2c_master_transmit_receive(probe_dev, (uint8_t[]){ 0x00 }, 1, &reg0, 1, 100);
+        i2c_master_transmit_receive(probe_dev, (uint8_t[]){ 0x75 }, 1, &reg75, 1, 100);
+        printf("I2C: device at 0x%02x (reg[0x00]=0x%02x reg[0x75]=0x%02x)\n", addr, reg0, reg75);
+
+        if (addr == ADXL345_ADDR && reg0 == ADXL345_DEVID_VALUE) {
+            i2c_bus = bus;
+            adxl345_dev = probe_dev;
+            found = true;
+            printf("I2C: ADXL345 detected, SDA=%d SCL=%d\n", sda, scl);
+            break;
+        }
+        if (addr == I2C_ADDR_INVENSENSE && reg75 == MPU6050_ADDR) {
+            i2c_bus = bus;
+            adxl345_dev = probe_dev;
+            sensor_is_mpu6050 = true;
+            found = true;
+            printf("I2C: MPU-6050 detected, SDA=%d SCL=%d\n", sda, scl);
+            break;
+        }
+        i2c_master_bus_rm_device(probe_dev);
+    }
+    if (!found) {
+        i2c_del_master_bus(bus);
+        printf("I2C: no ADXL345 on SDA=%d SCL=%d\n", sda, scl);
+    }
 }
 
-// The SuperMini has an onboard LED on GPIO 8 which disturbs I2C, and the
-// soldered wires may have SDA/SCL swapped. Try plausible combinations at
-// boot and adopt the first one where the ADXL345 actually responds.
+// Wires are soldered to GPIO 8/9 (SuperMini). Scan as wired first, then
+// swapped, in case SDA/SCL are reversed on the sensor cable.
 static void i2c_init(void)
 {
-    const struct { int sda, scl, freq; const char *note; } attempts[] = {
-        { I2C_SDA, I2C_SCL, 100000, "as wired, 100 kHz" },
-        { I2C_SCL, I2C_SDA, 100000, "SDA/SCL swapped, 100 kHz" },
-        { I2C_SDA, I2C_SCL, 20000,  "as wired, 20 kHz (slow bus for weak pull-ups)" },
-        { I2C_SCL, I2C_SDA, 20000,  "SDA/SCL swapped, 20 kHz" },
-    };
-
-    for (size_t i = 0; i < sizeof(attempts) / sizeof(attempts[0]); i++) {
-        printf("I2C: trying SDA=%d SCL=%d (%s)...\n", attempts[i].sda, attempts[i].scl, attempts[i].note);
-        esp_err_t ret = i2c_try_bus(attempts[i].sda, attempts[i].scl, attempts[i].freq,
-                                    &i2c_bus, &adxl345_dev);
-        if (ret == ESP_OK) {
-            printf("I2C: ADXL345 found with SDA=%d SCL=%d freq=%d Hz\n",
-                   attempts[i].sda, attempts[i].scl, attempts[i].freq);
-            return;
-        }
-        printf("I2C: no response (err %d)\n", ret);
+    i2c_bus_recover(I2C_SDA, I2C_SCL);
+    i2c_scan_and_init_pins(I2C_SDA, I2C_SCL);
+    if (!adxl345_dev) {
+        i2c_scan_and_init_pins(I2C_SCL, I2C_SDA);
     }
-    printf("I2C: ADXL345 not found on any tried combination\n");
+    if (!adxl345_dev) {
+        printf("I2C: ADXL345 not found\n");
+    }
 }
 
 static esp_err_t adxl345_write_reg(uint8_t reg, uint8_t value)
@@ -395,6 +437,18 @@ static esp_err_t adxl345_read_reg(uint8_t reg, uint8_t *data, size_t len)
 
 static esp_err_t adxl345_init(void)
 {
+    if (sensor_is_mpu6050) {
+        // The MPU-6050 starts in sleep mode: wake it and select +/- 2 g.
+        esp_err_t ret = adxl345_write_reg(MPU6050_PWR_MGMT_1, 0x00);
+        if (ret != ESP_OK) return ret;
+
+        ret = adxl345_write_reg(MPU6050_ACCEL_CONFIG, 0x00);
+        if (ret != ESP_OK) return ret;
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+        return ESP_OK;
+    }
+
     uint8_t devid;
     esp_err_t ret = adxl345_read_reg(ADXL345_DEVID, &devid, 1);
     if (ret != ESP_OK) return ret;
@@ -419,6 +473,17 @@ static esp_err_t adxl345_init(void)
 static esp_err_t adxl345_read(int16_t *x, int16_t *y, int16_t *z)
 {
     uint8_t data[6];
+    if (sensor_is_mpu6050) {
+        esp_err_t ret = adxl345_read_reg(MPU6050_ACCEL_XOUT_H, data, 6);
+        if (ret != ESP_OK) return ret;
+        // The MPU reports 16384 LSB/g vs the ADXL345's 256 LSB/g in full-res:
+        // scale down by 64 so every game threshold keeps its original meaning.
+        *x = ((int16_t)((data[0] << 8) | data[1])) / 64;
+        *y = ((int16_t)((data[2] << 8) | data[3])) / 64;
+        *z = ((int16_t)((data[4] << 8) | data[5])) / 64;
+        return ESP_OK;
+    }
+
     esp_err_t ret = adxl345_read_reg(ADXL345_DATAX0, data, 6);
     if (ret != ESP_OK) return ret;
 
