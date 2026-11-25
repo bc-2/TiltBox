@@ -38,7 +38,7 @@ A handheld retro game console with tilt controls, featuring 9 games on an 8x8 LE
 |-----------|----------|-------------|------|
 | ESP32-C3 | 1 | Microcontroller (any ESP32-C3 dev board) | [Amazon](https://www.amazon.de/diymore-ESP32-C3-Development-Supports-Bluetooth/dp/B0DS23ML1L/ref=sr_1_1_sspa?th=1) |
 | WS2812 8x8 LED Matrix | 1 | 64 RGB LEDs in 8x8 grid | [Amazon](https://www.amazon.de/CJMCU-8x8-Development-Compatible-Arduino-Raspberry/dp/B0DDPWTH83/ref=sxin_15_pa_sp_search_thematic_sspa) |
-| ADXL345 | 1 | 3-axis accelerometer module (I2C) | [Amazon](https://www.amazon.de/APKLVSR-ADXL345-Digital-Accelerating-Transmission/dp/B0CRVL4S54/ref=sr_1_2_sspa) |
+| ADXL345 | 1 | 3-axis accelerometer module (I2C) — an **MPU-6050 (GY-521) works too**; the firmware auto-detects either chip | [Amazon](https://www.amazon.de/APKLVSR-ADXL345-Digital-Accelerating-Transmission/dp/B0CRVL4S54/ref=sr_1_2_sspa) |
 | USB Charger Board | 1 | LiPo charging module with protection | [Amazon](https://www.amazon.de/-/en/dp/B09C34TK4F?th=1) |
 | LiPo Battery | 1 | 3.7V lithium polymer battery | [Amazon](https://www.amazon.de/-/en/Seamuing-Lithium-Protective-Insulation-Development/dp/B087LTZW61/ref=sr_1_12) |
 | Threaded Inserts | 4 | M3x5x7 heat-set inserts for enclosure | [Amazon](https://www.amazon.de/Threaded-RX-M3x5-7-Lead-Free-Bushings-Insertion/dp/B08BCRZZS3/ref=sr_1_1_sspa) |
@@ -60,12 +60,22 @@ A handheld retro game console with tilt controls, featuring 9 games on an 8x8 LE
 
 ### ADXL345 Accelerometer (I2C)
 
+The firmware scans the I2C bus at boot and auto-detects the sensor, so both the
+original ADXL345 (address `0x53`) and an MPU-6050 (address `0x68`) work on the
+same wiring. If the sensor does not answer at boot, the display shows a single
+red pixel at position (3,3).
+
 | ADXL345 Pin | ESP32-C3 Pin |
 |-------------|--------------|
 | VCC | 3.3V |
 | GND | GND |
 | SDA | GPIO 8 |
 | SCL | GPIO 9 |
+
+> **ESP32-C3 SuperMini note:** the SuperMini has an onboard LED wired to
+> GPIO 8, which slightly loads the SDA line. The firmware works around this
+> with internal pull-ups and an I2C bus-recovery routine; if you redesign the
+> wiring, moving I2C to two free pins (e.g. GPIO 4/5) is cleaner.
 
 ## Build Instructions
 
@@ -145,7 +155,9 @@ Classic falling block game. Tilt left/right to move pieces, tilt forward to rota
 
 ## Building and Flashing
 
-Requires ESP-IDF v4.3+.
+Requires ESP-IDF v5.0+ (v6.1.1 tested). Older v4.3-based instructions no longer
+apply: the firmware uses the `rmt_tx` and `i2c_master` drivers introduced in
+v5, since the legacy RMT and I2C drivers were removed in v6.
 
 ```bash
 # Source ESP-IDF environment
@@ -160,6 +172,9 @@ idf.py flash
 # Monitor serial output
 idf.py monitor
 ```
+
+On first boot the console prints which sensor and I2C pins were detected,
+e.g. `I2C: ADXL345 detected, SDA=8 SCL=9` or `I2C: MPU-6050 detected, SDA=8 SCL=9`.
 
 ## Controls
 
