@@ -308,34 +308,88 @@ static void ws2812_send(void)
 static i2c_master_bus_handle_t i2c_bus = NULL;
 static i2c_master_dev_handle_t adxl345_dev = NULL;
 
-static void i2c_init(void)
+// ADXL345 identification value expected in the DEVID register
+#define ADXL345_DEVID_VALUE 0xE5
+
+// Try one bus configuration: return ESP_OK (and leave bus/dev handles valid)
+// only if the ADXL345 answers with its correct DEVID.
+static esp_err_t i2c_try_bus(int sda, int scl, int freq,
+                             i2c_master_bus_handle_t *out_bus,
+                             i2c_master_dev_handle_t *out_dev)
 {
     i2c_master_bus_config_t bus_config = {
         .i2c_port = I2C_PORT,
-        .sda_io_num = I2C_SDA,
-        .scl_io_num = I2C_SCL,
+        .sda_io_num = sda,
+        .scl_io_num = scl,
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_config, &i2c_bus));
+    i2c_master_bus_handle_t bus;
+    esp_err_t ret = i2c_new_master_bus(&bus_config, &bus);
+    if (ret != ESP_OK) return ret;
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = ADXL345_ADDR,
-        .scl_speed_hz = I2C_FREQ_HZ,
+        .scl_speed_hz = freq,
     };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(i2c_bus, &dev_config, &adxl345_dev));
+    i2c_master_dev_handle_t dev;
+    ret = i2c_master_bus_add_device(bus, &dev_config, &dev);
+    if (ret != ESP_OK) {
+        i2c_del_master_bus(bus);
+        return ret;
+    }
+
+    uint8_t devid = 0;
+    ret = i2c_master_transmit_receive(dev, (uint8_t[]){ ADXL345_DEVID }, 1, &devid, 1, 100);
+    if (ret != ESP_OK || devid != ADXL345_DEVID_VALUE) {
+        i2c_master_bus_rm_device(dev);
+        i2c_del_master_bus(bus);
+        return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
+    }
+
+    *out_bus = bus;
+    *out_dev = dev;
+    return ESP_OK;
+}
+
+// The SuperMini has an onboard LED on GPIO 8 which disturbs I2C, and the
+// soldered wires may have SDA/SCL swapped. Try plausible combinations at
+// boot and adopt the first one where the ADXL345 actually responds.
+static void i2c_init(void)
+{
+    const struct { int sda, scl, freq; const char *note; } attempts[] = {
+        { I2C_SDA, I2C_SCL, 100000, "as wired, 100 kHz" },
+        { I2C_SCL, I2C_SDA, 100000, "SDA/SCL swapped, 100 kHz" },
+        { I2C_SDA, I2C_SCL, 20000,  "as wired, 20 kHz (slow bus for weak pull-ups)" },
+        { I2C_SCL, I2C_SDA, 20000,  "SDA/SCL swapped, 20 kHz" },
+    };
+
+    for (size_t i = 0; i < sizeof(attempts) / sizeof(attempts[0]); i++) {
+        printf("I2C: trying SDA=%d SCL=%d (%s)...\n", attempts[i].sda, attempts[i].scl, attempts[i].note);
+        esp_err_t ret = i2c_try_bus(attempts[i].sda, attempts[i].scl, attempts[i].freq,
+                                    &i2c_bus, &adxl345_dev);
+        if (ret == ESP_OK) {
+            printf("I2C: ADXL345 found with SDA=%d SCL=%d freq=%d Hz\n",
+                   attempts[i].sda, attempts[i].scl, attempts[i].freq);
+            return;
+        }
+        printf("I2C: no response (err %d)\n", ret);
+    }
+    printf("I2C: ADXL345 not found on any tried combination\n");
 }
 
 static esp_err_t adxl345_write_reg(uint8_t reg, uint8_t value)
 {
+    if (!adxl345_dev) return ESP_ERR_INVALID_STATE;
     uint8_t buf[2] = { reg, value };
     return i2c_master_transmit(adxl345_dev, buf, sizeof(buf), 100);
 }
 
 static esp_err_t adxl345_read_reg(uint8_t reg, uint8_t *data, size_t len)
 {
+    if (!adxl345_dev) return ESP_ERR_INVALID_STATE;
     return i2c_master_transmit_receive(adxl345_dev, &reg, 1, data, len, 100);
 }
 
